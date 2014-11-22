@@ -293,11 +293,8 @@ bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c) {
             APPEND_STAT("bytes", "%llu", (unsigned long long)stats.curr_bytes);
             APPEND_STAT("curr_items", "%u", stats.curr_items);
             APPEND_STAT("total_items", "%u", stats.total_items);
-            APPEND_STAT("evictions", "%llu",
-                        (unsigned long long)stats.evictions);
-            APPEND_STAT("reclaimed", "%llu",
-                        (unsigned long long)stats.reclaimed);
             STATS_UNLOCK();
+            item_stats_totals(add_stats, c);
         } else if (nz_strcmp(nkey, stat_type, "items") == 0) {
             item_stats(add_stats, c);
         } else if (nz_strcmp(nkey, stat_type, "slabs") == 0) {
@@ -498,7 +495,7 @@ static int slab_rebalance_start(void) {
 }
 
 enum move_status {
-    MOVE_PASS=0, MOVE_DONE, MOVE_BUSY
+    MOVE_PASS=0, MOVE_DONE, MOVE_BUSY, MOVE_LOCKED
 };
 
 /* refcount == 0 is safe since nobody can incr while cache_lock is held.
@@ -522,36 +519,43 @@ static int slab_rebalance_move(void) {
         item *it = slab_rebal.slab_pos;
         status = MOVE_PASS;
         if (it->slabs_clsid != 255) {
-            refcount = refcount_incr(&it->refcount);
-            if (refcount == 1) { /* item is unlinked, unused */
-                if (it->it_flags & ITEM_SLABBED) {
-                    /* remove from slab freelist */
-                    if (s_cls->slots == it) {
-                        s_cls->slots = it->next;
-                    }
-                    if (it->next) it->next->prev = it->prev;
-                    if (it->prev) it->prev->next = it->next;
-                    s_cls->sl_curr--;
-                    status = MOVE_DONE;
-                } else {
-                    status = MOVE_BUSY;
-                }
-            } else if (refcount == 2) { /* item is linked but not busy */
-                if ((it->it_flags & ITEM_LINKED) != 0) {
-                    do_item_unlink_nolock(it, hash(ITEM_key(it), it->nkey, 0));
-                    status = MOVE_DONE;
-                } else {
-                    /* refcount == 1 + !ITEM_LINKED means the item is being
-                     * uploaded to, or was just unlinked but hasn't been freed
-                     * yet. Let it bleed off on its own and try again later */
-                    status = MOVE_BUSY;
-                }
+            void *hold_lock = NULL;
+            uint32_t hv = hash(ITEM_key(it), it->nkey);
+            if ((hold_lock = item_trylock(hv)) == NULL) {
+                status = MOVE_LOCKED;
             } else {
-                if (settings.verbose > 2) {
-                    fprintf(stderr, "Slab reassign hit a busy item: refcount: %d (%d -> %d)\n",
-                        it->refcount, slab_rebal.s_clsid, slab_rebal.d_clsid);
+                refcount = refcount_incr(&it->refcount);
+                if (refcount == 1) { /* item is unlinked, unused */
+                    if (it->it_flags & ITEM_SLABBED) {
+                        /* remove from slab freelist */
+                        if (s_cls->slots == it) {
+                            s_cls->slots = it->next;
+                        }
+                        if (it->next) it->next->prev = it->prev;
+                        if (it->prev) it->prev->next = it->next;
+                        s_cls->sl_curr--;
+                        status = MOVE_DONE;
+                    } else {
+                        status = MOVE_BUSY;
+                    }
+                } else if (refcount == 2) { /* item is linked but not busy */
+                    if ((it->it_flags & ITEM_LINKED) != 0) {
+                        do_item_unlink_nolock(it, hv);
+                        status = MOVE_DONE;
+                    } else {
+                        /* refcount == 1 + !ITEM_LINKED means the item is being
+                         * uploaded to, or was just unlinked but hasn't been freed
+                         * yet. Let it bleed off on its own and try again later */
+                        status = MOVE_BUSY;
+                    }
+                } else {
+                    if (settings.verbose > 2) {
+                        fprintf(stderr, "Slab reassign hit a busy item: refcount: %d (%d -> %d)\n",
+                            it->refcount, slab_rebal.s_clsid, slab_rebal.d_clsid);
+                    }
+                    status = MOVE_BUSY;
                 }
-                status = MOVE_BUSY;
+                item_trylock_unlock(hold_lock);
             }
         }
 
@@ -562,9 +566,10 @@ static int slab_rebalance_move(void) {
                 it->slabs_clsid = 255;
                 break;
             case MOVE_BUSY:
+                refcount_decr(&it->refcount);
+            case MOVE_LOCKED:
                 slab_rebal.busy_items++;
                 was_busy++;
-                refcount_decr(&it->refcount);
                 break;
             case MOVE_PASS:
                 break;
@@ -731,6 +736,8 @@ static void *slab_maintenance_thread(void *arg) {
  */
 static void *slab_rebalance_thread(void *arg) {
     int was_busy = 0;
+    /* So we first pass into cond_wait with the mutex held */
+    mutex_lock(&slabs_rebalance_lock);
 
     while (do_run_slab_rebalance_thread) {
         if (slab_rebalance_signal == 1) {
@@ -817,6 +824,15 @@ enum reassign_result_type slabs_reassign(int src, int dst) {
     ret = do_slabs_reassign(src, dst);
     pthread_mutex_unlock(&slabs_rebalance_lock);
     return ret;
+}
+
+/* If we hold this lock, rebalancer can't wake up or move */
+void slabs_rebalancer_pause(void) {
+    pthread_mutex_lock(&slabs_rebalance_lock);
+}
+
+void slabs_rebalancer_resume(void) {
+    pthread_mutex_unlock(&slabs_rebalance_lock);
 }
 
 static pthread_t maintenance_tid;
